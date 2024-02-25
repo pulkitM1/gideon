@@ -7,15 +7,21 @@ from query import query_loader
 parser = argparse.ArgumentParser(description='Mighty Small CB Loader')
 subparsers = parser.add_subparsers(help="workload type")
 
+
 def run_workload(args):
     task = argsToTask(args)
-    start_client_processes(task, standalone = True)
+    start_client_processes(task, standalone=True)
+
 
 def argsToTask(args):
-
     bucket = args.get('bucket')
     password = args.get('password')
     user_password = args.get('user_password')
+    num_processes = args.get('num_processes')
+    num_clients = args.get('num_clients')
+    enable_tls = args.get('enable_tls')
+    trust_store_path = args.get('trust_store_path')
+    user = args.get('user')
     active_hosts = args.get('hosts')
     ops_sec = args.get('ops')
     sizes = args.get('sizes')
@@ -23,38 +29,42 @@ def argsToTask(args):
     replicate_to = args.get('replicate_to')
     durability = args.get('durability')
     num_consumers = 1
-
-    ops_sec = int(ops_sec)/num_consumers
-    create_count = int(ops_sec *  args.get('create')/100)
-    update_count = int(ops_sec *  args.get('update')/100)
-    get_count = int(ops_sec *  args.get('get')/100)
-    del_count = int(ops_sec *  args.get('delete')/100)
-    exp_count = int(ops_sec *  args.get('expire')/100)
+    ops_sec = int(ops_sec) / num_consumers
+    create_count = int(ops_sec * args.get('create')/100)
+    update_count = int(ops_sec * args.get('update')/100)
+    get_count = int(ops_sec * args.get('get')/100)
+    del_count = int(ops_sec * args.get('delete')/100)
+    exp_count = int(ops_sec * args.get('expire')/100)
 
     ttl = args.get('ttl')
     miss_perc = args.get('miss')
 
     # broadcast to sdk_consumers
-    msg = {'bucket' : bucket,
-           'id' : bucket,
-           'password' : password,
-           'user_password' : user_password,
-           'ops_sec' : ops_sec,
-           'create_count' : create_count,
-           'update_count' : update_count,
-           'get_count' : get_count,
-           'del_count' : del_count,
-           'exp_count' : exp_count,
-           'cc_queues' : None,
-           'consume_queue' : None,
-           'ttl' : ttl,
-           'miss_perc' : miss_perc,
-           'active' : True,
-           'active_hosts' : active_hosts,
+    msg = {'bucket': bucket,
+           'id': bucket,
+           'enable_tls': enable_tls,
+           'trust_store_path': trust_store_path,
+           'password': password,
+           'user_password': user_password,
+           'num_processes': num_processes,
+           'num_clients': num_clients,
+           'user': user,
+           'ops_sec': ops_sec,
+           'create_count': create_count,
+           'update_count': update_count,
+           'get_count': get_count,
+           'del_count': del_count,
+           'exp_count': exp_count,
+           'cc_queues': None,
+           'consume_queue': None,
+           'ttl': ttl,
+           'miss_perc': miss_perc,
+           'active': True,
+           'active_hosts': active_hosts,
            'sizes': sizes,
            'persist_to': persist_to,
            'replicate_to': replicate_to,
-            'durability': durability}
+           'durability': durability}
 
     # set doc-template to this message
     msg_copy = copy.deepcopy(msg)
@@ -63,19 +73,19 @@ def argsToTask(args):
     msg_copy['template']['kv'] = {
         'type': 'gideon',
         'bucket': bucket,
-        'active_hosts' : active_hosts,
-        'ops_sec' : ops_sec,
+        'active_hosts': active_hosts,
+        'ops_sec': ops_sec,
         'sizes': sizes,
-        'durability':durability,
+        'durability': durability,
         'rating': "$flo",
         'city':  "$str",
         'state': "$str1",
-        'activity': ["$str20","$str20","$str20","$str5","$str15"],
+        'activity': ["$str20", "$str20", "$str20", "$str5", "$str15"],
         'profile': {
              'name':  "$str10",
              'likes': "$int",
              'online': "$boo",
-             'friends': ["$str","$str","$str","$str","$str"],
+             'friends': ["$str", "$str", "$str", "$str", "$str"],
              'status': "$str5 $str5 $str1 $str1 $str20"
          },
         "build_id": "$int4",
@@ -90,11 +100,10 @@ def argsToTask(args):
         "priority": "$str1",
         "os": "$str1",
         "build": "gideon-$int1",
-        "description": "$str10 $str5 $str15 $str1 $str20"
+        "description": "$str10 $str5 $str15 $str1 $str20",
+        "sum": "$str10 $str5 $str15 $str1 $str20"
     }
-
     return msg_copy
-
 
 
 def run_kv(args):
@@ -106,7 +115,6 @@ def run_kv(args):
         # override args
         for opt in spec:
             args[opt] = spec[opt]
-
     run_workload(args)
 
 
@@ -114,6 +122,11 @@ def init_kv_parser():
 
     kv_parser = subparsers.add_parser('kv')
     kv_parser.add_argument("--spec",  help="workload specification file", default=None)
+    kv_parser.add_argument("--user", help="user name")
+    kv_parser.add_argument("--num_processes", help="num_processes", type=int, default=6)
+    kv_parser.add_argument("--num_clients", help="num_clients", type=int, default=6)
+    kv_parser.add_argument("--enable_tls", help="enable_tls", type=bool, default=False)
+    kv_parser.add_argument("--trust_store_path", help="trust_store_path", default=None)
     kv_parser.add_argument("--bucket",  help="bucket", default="default")
     kv_parser.add_argument("--password", help="password", default="")
     kv_parser.add_argument("--user_password", help="rbac user password", default="password")
@@ -139,10 +152,14 @@ def init_kv_parser():
 def run_query(args):
     query_loader(args)
 
+
 def init_query_parser():
     query_parser = subparsers.add_parser('query')
     query_parser.add_argument("--host",  help="host to send query requests", default="127.0.0.1")
     query_parser.add_argument("--port",  help="couch query port", default="8092")
+    query_parser.add_argument("--user", help="user name")
+    query_parser.add_argument("--num_processes", help="num_processes", type=int, default=4)
+    query_parser.add_argument("--num_clients", help="num_clients", type=int, default=4)
     query_parser.add_argument("--bucket",  help="bucket with design doc", default="default")
     query_parser.add_argument("--ddoc",  help="design doc name", default=None, required=True)
     query_parser.add_argument("--view",  help="name of view", default="default", required=True)

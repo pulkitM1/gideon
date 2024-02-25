@@ -1,8 +1,10 @@
 import requests
 import eventlet
 
+
 def _query(args):
     r = requests.get(args['url'], params=args['params'])
+
 
 def query_loader(args):
 
@@ -16,7 +18,7 @@ def query_loader(args):
         for p in params:
             key, value = p.split(":")
             url_params[key] = value
-    url = "/".join(["http:/", host,bucket,"_design",ddoc,"_view",view])
+    url = "/".join(["http:/", host, bucket, "_design", ddoc, "_view", view])
     args = {"url": url,
             "params": url_params}
 

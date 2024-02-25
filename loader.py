@@ -3,25 +3,18 @@ import sys
 import datetime
 import time
 import json
-import gevent
 import random
-import argparse
-
-# couchbase
-# from couchbase.experimental import enable as enable_experimental
-from couchbase.exceptions import NotFoundError, TemporaryFailError, TimeoutError, NetworkError, AuthError
-# enable_experimental()
-from gcouchbase.bucket import Bucket
 from couchbase.cluster import Cluster
-from couchbase_core.cluster import PasswordAuthenticator
+from couchbase.auth import PasswordAuthenticator
 from couchbase.durability import Durability
-from couchbase.cluster import ClusterOptions
+from couchbase.options import ClusterOptions
+from couchbase.exceptions import TimeoutException, InvalidArgumentException, BucketNotFoundException, RequestCanceledException
 
 # para
-from gevent import Greenlet, queue
+from gevent import queue
 import threading
-import multiprocessing
-from multiprocessing import Process, Event, queues
+from multiprocessing import Event, Process
+
 
 from gevent import monkey
 
@@ -30,34 +23,37 @@ monkey.patch_all()
 # logging
 import logging
 
-logging.basicConfig(filename='consumer.log', level=logging.DEBUG)
+logging.basicConfig(level=logging.DEBUG)
 
 # some global state
 CB_CLUSTER_TAG = "default"
-CLIENTSPERPROCESS = 4
-PROCSPERTASK = 4
-MAXPROCESSES = 16
 PROCSSES = {}
 
 
-class SDKClient(threading.Thread):
+def keyMapToKeys(key_map):
+    keys = []
+    # reconstruct key-space
+    prefix, start_idx = key_map['start'].split('_')
+    prefix, end_idx = key_map['end'].split('_')
 
+    for i in range(int(start_idx), int(end_idx) + 1):
+        keys.append(prefix + "_" + str(i))
+
+    return keys
+
+
+class SDKClient(threading.Thread):
     def __init__(self, name, task, e):
         threading.Thread.__init__(self)
         self.name = name
         self.i = 0
-        self.op_factor = CLIENTSPERPROCESS * PROCSPERTASK
         self.ops_sec = task['ops_sec']
         self.bucket = task['bucket']
         self.password = task['password']
         self.user_password = task['user_password']
+        self.user = task['user']
         self.template = task['template']
         self.default_tsizes = task['sizes']
-        self.create_count = int(task['create_count'] / self.op_factor)
-        self.update_count = int(task['update_count'] / self.op_factor)
-        self.get_count = int(task['get_count'] / self.op_factor)
-        self.del_count = int(task['del_count'] / self.op_factor)
-        self.exp_count = int(task['exp_count'] / self.op_factor)
         self.ttl = task['ttl']
         self.persist_to = task['persist_to']
         self.replicate_to = task['replicate_to']
@@ -70,15 +66,21 @@ class SDKClient(threading.Thread):
         self.standalone = task['standalone']
         self.ccq = None
         self.hotkey_batches = []
+        self.op_factor = task['num_clients'] * task['num_processes']
+        self.create_count = int(task['create_count'] / self.op_factor)
+        self.update_count = int(task['update_count'] / self.op_factor)
+        self.get_count = int(task['get_count'] / self.op_factor)
+        self.del_count = int(task['del_count'] / self.op_factor)
+        self.exp_count = int(task['exp_count'] / self.op_factor)
 
-        if self.durability== None:
-            self.durability_level=Durability.NONE
-        elif self.durability== 'majority':
-            self.durability_level=Durability.MAJORITY
+        if self.durability is None:
+            self.durability_level = Durability.NONE
+        elif self.durability == 'majority':
+            self.durability_level = Durability.MAJORITY
         elif self.durability == 'majority_and_persist_on_master':
-            self.durability_level=Durability.MAJORITY_AND_PERSIST_ON_MASTER
+            self.durability_level = Durability.MAJORITY_AND_PERSIST_ON_MASTER
         elif self.durability == 'persist_to_majority':
-            self.durability_level=Durability.PERSIST_TO_MAJORITY
+            self.durability_level = Durability.PERSIST_TO_MAJORITY
 
         if self.ttl:
             self.ttl = int(self.ttl)
@@ -104,26 +106,26 @@ class SDKClient(threading.Thread):
             port_mod = int(port) % 9000
             if port_mod != 8091:
                 port = str(12000 + port_mod)
-            auther = PasswordAuthenticator(self.bucket, self.user_password)
-            endpoint = 'couchbase://{0}:{1}'.format(host,port)
-            cluster = Cluster(endpoint, ClusterOptions(auther))
-            self.cb = cluster.bucket(self.bucket).default_collection()
+            auther = PasswordAuthenticator(self.user, self.user_password)
+            options = ClusterOptions(auther, enable_tls=task['enable_tls'], trust_store_path=task['trust_store_path'])
+            endpoint = 'couchbase://{0}'.format(host)
+            self.cluster = Cluster.connect(endpoint, options)
+            self.cb = self.cluster.bucket(self.bucket).default_collection()
             self.cb.timeout = 30
+        except RequestCanceledException as ex:
+            logging.error("[Thread %s] Connection Request Cancelled %s" % (self.name, endpoint))
+            logging.error(ex)
         except Exception as ex:
-
             logging.error("[Thread %s] cannot reach %s" % (self.name, endpoint))
             logging.error(ex)
             #self.isterminal = True
-
         logging.info("[Thread %s] started for workload: %s" % (self.name, task['id']))
 
     def run(self):
-
         cycle = ops_total = 0
         self.e.set()
 
-        while self.e.is_set() == True:
-
+        while self.e.is_set():
             start = datetime.datetime.now()
 
             # do an op cycle
@@ -156,12 +158,10 @@ class SDKClient(threading.Thread):
         return  # todo for dirty keys
 
     def do_cycle(self):
-
         sizes = self.template.get('size') or self.default_tsizes
         t_size = sizes[random.randint(0, len(sizes) - 1)]
         self.template['t_size'] = t_size
         if self.create_count > 0:
-
             count = self.create_count
             docs_to_expire = self.exp_count
             # check if we need to expire some docs
@@ -188,7 +188,6 @@ class SDKClient(threading.Thread):
         keys = []
         cursor = 0
         j = 0
-
         template = resolveTemplate(template)
         for j in range(int(count)):
             self.i = self.i + 1
@@ -207,22 +206,20 @@ class SDKClient(threading.Thread):
                 self.memq.put_nowait({'start': batch[0], 'end': batch[-1]})
 
     def _mset(self, msg, ttl=0, persist_to=0, replicate_to=0,durability_level=Durability.NONE):
-
         try:
             self.cb.upsert_multi(msg, ttl=ttl, persist_to=persist_to, replicate_to=replicate_to,durability_level=durability_level)
-        except TemporaryFailError:
-            logging.warn("temp failure during mset - cluster may be unstable")
-        except TimeoutError:
-            logging.warn("cluster timed trying to handle mset")
-        except NetworkError as nx:
-            logging.error("network error")
-            logging.error(nx)
+
+        except TimeoutException as toe:
+            logging.error("timeout exception occurred  %s" % toe)
+        except InvalidArgumentException as iae:\
+        logging.error("invalid argument exception  %s: " % iae)
+        except BucketNotFoundException as bnfe:
+            logging.error("bucket not found exception occurred  %s" % bnfe)
         except Exception as ex:
             logging.error(ex)
-            #self.isterminal = True
+            # self.isterminal = True
 
     def mset_update(self, template, count, persist_to=0, replicate_to=0,durability_level=Durability.NONE):
-
         msg = {}
         batches = self.getKeys(count)
         template = resolveTemplate(template)
@@ -233,21 +230,19 @@ class SDKClient(threading.Thread):
                     for key in batch:
                         msg[key] = template
                     self.cb.upsert_multi(msg, persist_to=persist_to, replicate_to=replicate_to,durability_level=durability_level)
-                except NotFoundError as nf:
-                    logging.error("update key not found!  %s: " % nf.key)
                 except TimeoutError:
-                    logging.warn("cluster timed out trying to handle mset - cluster may be unstable")
-                except NetworkError as nx:
-                    logging.error("network error")
-                    logging.error(nx)
-                except TemporaryFailError:
-                    logging.warn("temp failure during mset - cluster may be unstable")
+                    logging.warning("cluster timed out trying to handle mset - cluster may be unstable")
+                except InvalidArgumentException as iae:
+                    logging.error("invalid argument exception  %s: " % iae)
+                except TimeoutException as toe:
+                    logging.error("timeout exception occurred  %s" % toe)
+                except BucketNotFoundException as bnfe:
+                    logging.error("bucket not found exception occurred  %s" % bnfe)
                 except Exception as ex:
                     logging.error(ex)
-                    #self.isterminal = True
+                    # self.isterminal = True
 
     def mget(self, count):
-
         batches = []
         if self.miss_perc > 0:
             batches = self.getCacheMissKeys(count)
@@ -259,14 +254,14 @@ class SDKClient(threading.Thread):
             for batch in batches:
                 try:
                     self.cb.get_multi(batch)
-                except NotFoundError as nf:
-                    logging.warn("get key not found!  %s: " % nf.key)
-                    pass
                 except TimeoutError:
                     logging.warn("cluster timed out trying to handle mget - cluster may be unstable")
-                except NetworkError as nx:
-                    logging.error("network error")
-                    logging.error(nx)
+                except InvalidArgumentException as iae:
+                    logging.error("invalid argument exception  %s: " % iae)
+                except TimeoutException as toe:
+                    logging.error("timeout exception occurred  %s" % toe)
+                except BucketNotFoundException as bnfe:
+                    logging.error("bucket not found exception occurred  %s" % bnfe)
                 except Exception as ex:
                     logging.error(ex)
                     #self.isterminal = True
@@ -288,13 +283,14 @@ class SDKClient(threading.Thread):
                 if len(batch) > 0:
                     keys_deleted = len(batch) + keys_deleted
                     self.cb.remove_multi(batch,durability_level=durability_level)
-            except NotFoundError as nf:
-                logging.warn("get key not found!  %s: " % nf.key)
             except TimeoutError:
-                logging.warn("cluster timed out trying to handle mdelete - cluster may be unstable")
-            except NetworkError as nx:
-                logging.error("network error")
-                logging.error(nx)
+                logging.warning("cluster timed out trying to handle mdelete - cluster may be unstable")
+            except InvalidArgumentException as iae:
+                logging.error("invalid argument exception  %s: " % iae.key)
+            except TimeoutException as toe:
+                logging.error("timeout exception occurred  %s" % toe)
+            except BucketNotFoundException as bnfe:
+                logging.error("bucket not found exception occurred  %s" % bnfe)
             except Exception as ex:
                 logging.error(ex)
                 #self.isterminal = True
@@ -302,7 +298,6 @@ class SDKClient(threading.Thread):
         return keys_deleted
 
     def getCacheMissKeys(self, count):
-
         # returns batches of keys where first batch contains # of keys to miss
         keys_retrieved = 0
         batches = []
@@ -321,15 +316,12 @@ class SDKClient(threading.Thread):
         return batches
 
     def getKeys(self, count, requeue=True, force_stale=False):
-
         keys_retrieved = 0
         batches = []
 
         while keys_retrieved < count:
-
             # get keys
             keys = self.getKeysFromQueue(requeue, force_stale=force_stale)
-
             if len(keys) == 0:
                 break
 
@@ -346,7 +338,6 @@ class SDKClient(threading.Thread):
         return batches
 
     def getKeysFromQueue(self, requeue=True, force_stale=False):
-
         # get key mapping and convert to keys
         keys = []
         key_map = None
@@ -360,24 +351,11 @@ class SDKClient(threading.Thread):
             key_map = self.getKeyMapFromLocalQueue(requeue)
 
         if key_map:
-            keys = self.keyMapToKeys(key_map)
-
-        return keys
-
-    def keyMapToKeys(self, key_map):
-
-        keys = []
-        # reconstruct key-space
-        prefix, start_idx = key_map['start'].split('_')
-        prefix, end_idx = key_map['end'].split('_')
-
-        for i in range(int(start_idx), int(end_idx) + 1):
-            keys.append(prefix + "_" + str(i))
+            keys = keyMapToKeys(key_map)
 
         return keys
 
     def fillq(self):
-
         if (self.consume_queue == None) and (self.ccq == None):
             return
 
@@ -391,7 +369,6 @@ class SDKClient(threading.Thread):
             "[Thread %s] filled %s items from  %s" % (self.name, self.memq.qsize(), self.consume_queue or self.ccq))
 
     def getKeyMapFromLocalQueue(self, requeue=True):
-
         key_map = None
 
         try:
@@ -409,70 +386,56 @@ class SDKClient(threading.Thread):
 
 
 class SDKProcess(Process):
-
     def __init__(self, id, task):
-
         super(SDKProcess, self).__init__()
-
         self.task = task
         self.id = id
+
+    def run(self):
         self.clients = []
         p_id = self.id
-        self.client_events = [Event() for e in range(CLIENTSPERPROCESS)]
-        for i in range(CLIENTSPERPROCESS):
-            name = str(_random_string(4)) + "-" + str(p_id) + str(i) + "_"
-
+        self.client_events = [Event() for _ in range(self.task['num_clients'])]
+        for i in range(self.task['num_clients']):
+            name = f"{_random_string(4)}-{p_id}{i}_"
             # start client
             client = SDKClient(name, self.task, self.client_events[i])
             self.clients.append(client)
-
             p_id = p_id + 1
 
-    def run(self):
-
-        logging.info("[Process %s] started workload: %s" % (self.id, self.task['id']))
-
-        # start process clients
         for client in self.clients:
             client.start()
 
-        # monitor running threads and restart if any die
-        while True:
-
-            i = -1
-            # if we find a dead client - restart it
-            for client in self.clients:
-                if client.is_alive() == False:
-
-                    i = i + 1
-
-                    if client.e.is_set() == True:
-                        logging.info("[Thread %s] died" % (client.name))
-                        new_client = SDKClient(client.name, self.task, client.e)
-                        new_client.start()
-                        self.clients.append(new_client)
-                        logging.info("[Thread %s] restarting..." % (new_client.name))
-                    else:
-                        logging.info("[Thread %s] stopped by parent" % (client.name))
-
+        running = True
+        while running:
+            # loop over the clients and their indices
+            for i, client in enumerate(self.clients):
+                # attempt to restart if we find a dead client
+                if not client.is_alive():
+                    logging.info("[Thread %s] %s" % (client.name, "died" if client.e.is_set() else "stopped by parent"))
+                    try:
+                        if client.e.is_set():
+                            new_client = SDKClient(client.name, self.task, client.e)
+                            new_client.start()
+                            self.clients.append(new_client)
+                            logging.info("[Thread %s] restarting..." % (new_client.name))
+                    except Exception as e:
+                        logging.error("[Thread %s] failed to restart: %s" % (
+                            client.name, e))
+                    finally:
+                        del self.clients[i]
                     break
-
-            if i > -1:
-                del self.clients[i]
-
             time.sleep(5)
 
-    def terminate(self):
-        for e in self.client_events:
-            e.clear()
-
-        super(SDKProcess, self).terminate()
-        logging.info("[Process %s] terminated workload: %s" % (self.id, self.task['id']))
+        def terminate(self):
+            for event in self.client_events:
+                event.clear()
+            super(SDKProcess, self).terminate()
+            logging.info("[Process %s] terminated workload: %s" % (self.id, self.task['id']))
 
 
 def _random_string(length):
     length = int(length)
-    return (("%%0%dX" % (length * 2)) % random.getrandbits(length * 8))
+    return ("%%0%dX" % (length * 2)) % random.getrandbits(length * 8)
 
 
 def _random_int(length):
@@ -496,19 +459,13 @@ def kill_nprocs(id_, kill_num=None):
 
 
 def start_client_processes(task, standalone=False):
+    process_per_task = task['num_processes']
     task['standalone'] = standalone
     workload_id = task['id']
     PROCSSES[workload_id] = []
-
-    for i in range(PROCSPERTASK):
-        # set process id and provide queue
-        p_id = (i) * CLIENTSPERPROCESS
-        p = SDKProcess(p_id, task)
-
-        # start
+    processes = [SDKProcess(p_id, task) for p_id in range(process_per_task)]
+    for p in processes:
         p.start()
-
-        # archive
         PROCSSES[workload_id].append(p)
 
 
@@ -528,11 +485,9 @@ def init(message):
         return
 
     if task['active'] == False:
-
         # stop processes running a workload
         workload_id = task['id']
         kill_nprocs(workload_id)
-
 
     else:
         try:

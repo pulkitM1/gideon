@@ -1,4 +1,4 @@
----
+
 bucket: default
 ops: 2000 
 create: 100 
@@ -9,4 +9,4 @@ miss: 0
 expire: 0
 ttl: 15
 hosts:
-  - 127.0.0.1
+  - 172.23.104.97
