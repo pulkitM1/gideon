@@ -23,7 +23,7 @@ monkey.patch_all()
 # logging
 import logging
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(filename='consumer.log', level=logging.DEBUG)
 
 # some global state
 CB_CLUSTER_TAG = "default"
@@ -426,11 +426,11 @@ class SDKProcess(Process):
                     break
             time.sleep(5)
 
-        def terminate(self):
-            for event in self.client_events:
-                event.clear()
-            super(SDKProcess, self).terminate()
-            logging.info("[Process %s] terminated workload: %s" % (self.id, self.task['id']))
+    def terminate(self):
+        for event in self.client_events:
+            event.clear()
+        super(SDKProcess, self).terminate()
+        logging.info("[Process %s] terminated workload: %s" % (self.id, self.task['id']))
 
 
 def _random_string(length):
